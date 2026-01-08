@@ -4,13 +4,18 @@ import hu.infokristaly.homework4websocketserver.cv.AdvancedMotionDetector;
 import jakarta.websocket.CloseReason;
 import org.bytedeco.javacv.*;
 import org.bytedeco.opencv.opencv_core.Mat;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.BinaryWebSocketHandler;
 import java.io.*;
 import java.nio.file.*;
-//import java.util.HashMap;
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.concurrent.*;
 
 @Component
@@ -19,12 +24,23 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
     @Value("${video.path:src/main/resources/videos}")
     private String videoPath;
 
+    @Value("${mqtt.broker}")
+    private String broker;
+
+    @Value("${mqtt.topic}")
+    private String topic;
+
+    @Value("${mqtt.message}")
+    private String content;
+
     private class SessionData {
         private AsyncInputStream asyncStream = null;
         private ExecutorService executor = null;
         private FFmpegFrameGrabber grabber;
         private volatile boolean isRunning = false;
         private AdvancedMotionDetector detector = new AdvancedMotionDetector();
+        private LocalDateTime lastMotionDetect = null;
+        private MqttClient mqttClient = null;
     }
 
     private ConcurrentHashMap<String,SessionData> sesssionHolder = new ConcurrentHashMap<>();
@@ -42,14 +58,13 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
         System.out.println("VideoStreamHandler connected ["+session.getId()+"]");
         Files.createFile(Paths.get(videoPath,session.getId()+".webm"));
         sessionData.executor = Executors.newSingleThreadExecutor();
+
         sessionData.executor.submit(() -> {
             try {
                 while (sessionData.isRunning) {
                     try {
-                        // 1. Puffer ürítése, hogy tiszta fejléccel induljunk
                         sessionData.asyncStream.clear();
 
-                        // 2. Várakozás az új adatokra (Angular vagy Szimuláció indítása után)
                         System.out.println("Várakozás tiszta fejlécre...");
                         while (sessionData.isRunning && sessionData.asyncStream.getAvailableBytes() < 1024 * 1024) {
                             Thread.sleep(100);
@@ -59,40 +74,55 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
                         sessionData.grabber.setVideoCodecName("vp8");
                         sessionData.grabber.setFormat("webm");
 
-                        //grabber.setOption("rw_timeout", "10000000");
                         sessionData.grabber.setOption("fflags", "nobuffer+igndts");
                         sessionData.grabber.setOption("probesize", "1048576");
-                        //grabber.setOption("is_live", "1");
                         System.out.println("FFmpeg indítása...");
                         sessionData.grabber.start(false);
                         System.out.println("FFmpeg sikeresen elindult.");
+
+                        sessionData.mqttClient = new MqttClient(broker, session.getId());
+                        MqttConnectOptions connOpts = new MqttConnectOptions();
+                        connOpts.setCleanSession(true);
+                        System.out.println("Csatlakozás a brokerhez: " + broker);
+                        sessionData.mqttClient.connect(connOpts);
+
+                        MqttMessage message = new MqttMessage(("[" + session.getId() + "] " + content).getBytes());
+                        message.setQos(2);
 
                         OpenCVFrameConverter.ToMat converter = new OpenCVFrameConverter.ToMat();
                         int nullFrameCount = 0;
                         while (sessionData.isRunning) {
                             try {
-                                // A grabImage() előtt állítsunk be egy belső timeoutot (opcionális, de jó, ha van)
                                 Frame frame = sessionData.grabber.grabImage();
 
                                 if (frame == null) {
                                     nullFrameCount++;
-                                    // Ha pl. 2 másodpercig (20 * 100ms) nem jön kép, szakítsuk meg a belső ciklust
                                     if (nullFrameCount > 20) {
                                         System.out.println("A stream megszakadt vagy elfogyott az adat. Újraindítás...");
-                                        break; // Kilépünk a belső ciklusból, hogy a külső újraindíthassa
+                                        break;
                                     }
                                     Thread.sleep(500);
                                     continue;
                                 }
 
-                                // Ha kaptunk frame-et, nullázzuk a számlálót
                                 nullFrameCount = 0;
 
                                 if (frame.image != null) {
                                     Mat mat = converter.convert(frame);
                                     if (mat != null && !mat.empty()) {
-                                        if (sessionData.detector.detectMotionFromMat(mat)) {
+                                        LocalDateTime end = LocalDateTime.now();
+                                        if (sessionData.lastMotionDetect == null) {
+                                            sessionData.mqttClient.publish(topic, message);
                                             System.out.println("Mozgás észlelve!");
+                                            sessionData.lastMotionDetect = end;
+                                        } else {
+                                            Duration duration = Duration.between(sessionData.lastMotionDetect, end);
+                                            long toSeconds = duration.toSeconds();
+                                            if (sessionData.detector.detectMotionFromMat(mat) && (toSeconds > 15)) {
+                                                sessionData.mqttClient.publish(topic, message);
+                                                System.out.println("Mozgás észlelve!");
+                                                sessionData.lastMotionDetect = end;
+                                            }
                                         }
                                         mat.release();
                                     }
@@ -115,6 +145,26 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
                         if (sessionData.grabber != null) {
                             sessionData.grabber.close();
                             sessionData.grabber.release();
+                        }
+                        if (sessionData.mqttClient != null) {
+                            try {
+                                if (sessionData.mqttClient.isConnected()) {
+                                    // 1. Megszüntetjük a hálózati kapcsolatot (időtúllépéssel, hogy ne akadjon el)
+                                    sessionData.mqttClient.disconnect(5000);
+                                    System.out.println("Kapcsolat bontva.");
+                                }
+                            } catch (MqttException e) {
+                                System.err.println("Hiba a bontás során: " + e.getMessage());
+                            } finally {
+                                try {
+                                    // 2. Felszabadítjuk az erőforrásokat (memória, szálak)
+                                    // Ezt csak a disconnect után szabad!
+                                    sessionData.mqttClient.close();
+                                    System.out.println("Ügyfél véglegesen lezárva.");
+                                } catch (MqttException e) {
+                                    System.err.println("Hiba a lezárás során.");
+                                }
+                            }
                         }
                     }
                 }
