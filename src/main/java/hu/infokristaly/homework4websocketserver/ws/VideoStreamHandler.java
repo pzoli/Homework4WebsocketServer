@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.*;
@@ -25,7 +26,6 @@ import java.util.concurrent.*;
 @Component
 public class VideoStreamHandler extends BinaryWebSocketHandler {
 
-    private static final String HEADER_FILE_NAME = "-header.bin";
     private final static String SOURCE_NAME = "[source]:";
 
     @Value("${video.path:src/main/resources/videos}")
@@ -52,7 +52,7 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
     private static class SessionData {
         public LocalDateTime recordStartTime;
         public boolean isHeaderGrabbed = false;
-        public String heaerFileName;
+        public byte[] header;
         private String source;
         private String sessionName;
         private AsyncInputStream asyncStream = null;
@@ -226,8 +226,7 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
         payload.get(data);
 
         if (!sessionData.isHeaderGrabbed) {
-            sessionData.heaerFileName = Paths.get(tempPath, session.getId() + HEADER_FILE_NAME).toString();
-            saveWebMHeader(data, sessionData.heaerFileName);
+            sessionData.header = getVideoMHeader(data);
             sessionData.isHeaderGrabbed = true;
         }
 
@@ -240,8 +239,9 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
             String fileName = sessionData.sessionName + ".webm";
             sessionData.fileList.add(fileName);
             Files.createFile(Paths.get(tempPath,fileName));
-            byte[] header = Files.readAllBytes(Paths.get(sessionData.heaerFileName));
-            Files.write(Paths.get(tempPath,sessionData.sessionName + ".webm"), header, StandardOpenOption.APPEND);
+            if (!isConcatFilesEnabled) {
+                Files.write(Paths.get(tempPath,sessionData.sessionName + ".webm"), sessionData.header, StandardOpenOption.APPEND);
+            }
         }
 
         totalBytesReceived += size;
@@ -284,7 +284,6 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
                     for(String fileName : sessionData.fileList) {
                         fixVideoDuration(Paths.get(tempPath,fileName).toString());
                     }
-                    Files.delete(Paths.get(sessionData.heaerFileName));
                 }
             } catch (Exception e) {
                 e.printStackTrace();
@@ -299,11 +298,6 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-        }
-        try {
-            Files.delete(Paths.get(tempPath, sessionId + HEADER_FILE_NAME));
-        } catch (IOException e) {
-            e.printStackTrace();
         }
     }
 
@@ -344,7 +338,7 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
         return outputPath.toString();
     }
 
-    public void saveWebMHeader(byte[] firstChunk, String outputPath) throws IOException {
+    public byte[] getVideoMHeader(byte[] firstChunk) throws IOException {
         // A WebM/EBML 'Cluster' elem azonosítója: 0x1F 0x43 0xB6 0x75
         byte[] clusterTag = {(byte) 0x1F, (byte) 0x43, (byte) 0xB6, (byte) 0x75};
 
@@ -355,10 +349,7 @@ public class VideoStreamHandler extends BinaryWebSocketHandler {
             headerLimit = firstChunk.length;
         }
 
-        try (FileOutputStream fos = new FileOutputStream(outputPath)) {
-            fos.write(firstChunk, 0, headerLimit);
-        }
-        System.out.println("WebM fejléc mentve: " + headerLimit + " bájt hosszban.");
+        return Arrays.copyOf(firstChunk, headerLimit);
     }
 
     // Segédfüggvény a bájtsorozat megkereséséhez
